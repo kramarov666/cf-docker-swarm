@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Swarm init
+
+# ------------------------------------------------------------------------------
+# Parameters
+# ------------------------------------------------------------------------------
+Parameters:
+  AutoScalingDesiredCapacity:
+    Type: Number
+    Default: 1
+
+  AutoScalingMaxSize:
+    Type: Number
+    Default: 1
+
+  AutoScalingMinSize:
+    Type: Number
+    Default: 1
+
+  Name:
+    Type: String
+    Description: Name of Swarm stack and deployment.
+    Default: test-summed
+  
+  AMI:
+    Type: AWS::EC2::Image::Id
+    Description: Amazon machine image to use (see https://aws.amazon.com/amazon-linux-2/release-notes/).
+    Default: ami-0b69ea66ff7391e80
+ #  amazon/amzn2-ami-hvm-2.0.20190823.1-x86_64-gp2
+  
+  EcrRole:
+    Type: String
+    Description: Role to read ECR.
+    Default: ecr-read-role-Role-KK2GTT863NVQ
+
+  SwarmBucketName:
+    Type: String
+    Description: Bucket name for Swarm, must be same for all clusters.
+    Default: swarm-bucket-summed
+
+  SecurityGroupForInternalCLB:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security groups for Internal Classic Load Balancer.
+
+  
+  #Must be created in the same template
+  #TargetGroups:
+  #  Description: Target groups of external Load Balancer ARN
+  #  Type: CommaDelimitedList
+  #  Default: "dev-summed-admin,dev-summed-api,summed-fronten,dev-summed-portainer"
+  InstanceType:
+    Type: String
+    Description: Instance type.
+    AllowedValues:
+    - t2.micro
+    - t2.small
+    - t2.medium
+    - t2.large
+    - t2.xlarge
+    - t3.micro
+    - t3.small
+    - t3.medium
+    - t3.large
+    - t3.xlarge
+    - t3a.micro
+    - t3a.small
+    - t3a.medium
+    - t3a.large
+    - t3a.xlarge
+    - c3.large
+    - m3.medium
+    - m4.large
+    - m5.large
+
+    Default: t3a.medium
+
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID.
+#Todo only private 
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private Subnets where swarm will be deployed.
+
+  SecurityGroups:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security groups for EC2 instances.
+
+
+
+# ------------------------------------------------------------------------------
+# Resources
+# ------------------------------------------------------------------------------
+Resources:
+#  SwarmBucket:
+#    Type: AWS::S3::Bucket
+#    DeletionPolicy: Retain
+#    Properties:
+#      AccessControl: Private
+#      BucketName: !Sub ${SwarmBucketName}
+
+  InternalCLB:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties: 
+      ConnectionDrainingPolicy:
+        Enabled: true
+        Timeout: 60
+      ConnectionSettings:
+        IdleTimeout: 120
+      CrossZone: true
+      Listeners:
+        - InstancePort: 8500
+          InstanceProtocol: TCP
+          LoadBalancerPort: 4500
+          Protocol: TCP
+
+      LoadBalancerName: !Sub "Internal-${Name}"
+      #Policies: 
+      Scheme: Internal
+      SecurityGroups: !Ref SecurityGroupForInternalCLB
+      Subnets: !Ref PrivateSubnets
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref PrivateSubnets
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 900
+      LaunchConfigurationName: !Ref LaunchConfig
+      LoadBalancerNames: 
+        - !Ref InternalCLB
+      #TargetGroupARNs:
+      #  - !Ref TargetGroups
+      DesiredCapacity: !Ref AutoScalingDesiredCapacity
+      MaxSize: !Ref AutoScalingMaxSize
+      MinSize: !Ref AutoScalingMinSize
+
+  LaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref AMI
+      KeyName: perf
+      AssociatePublicIpAddress: false
+      InstanceMonitoring: false
+      InstanceType: !Ref InstanceType
+      SecurityGroups: !Ref SecurityGroups
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+
+            # The bootstrap log can be found at:
+            # /var/log/cloud-init-output.log
+            # /var/log/cloud-init.log
+
+            # The following code will be placed into file on instance and executed:
+            # /var/lib/cloud/instance/scripts/part-001
+
+            set -e # Exit on error
+            set -u # Treat unset variables as error
+            set -x # Trace commands
+            set -o pipefail
+
+            # ------------------------------------------------------------------------------
+            # Common part for Amazon Linux setup on AWS EC2
+            # ------------------------------------------------------------------------------
+            # Set hostname containing instance id
+            INSTANCE_ID=$(curl -s 169.254.169.254/latest/meta-data/instance-id)
+            HOSTNAME="${Name}-${!INSTANCE_ID#i-}.localdomain"
+            INSTANCE_PRIVATE_IPV4=$(curl -s 169.254.169.254/latest/meta-data/local-ipv4)
+            CLUSTER_NOT_EXIST=false
+            hostnamectl set-hostname $HOSTNAME
+            echo "$(hostname -I) bastion $HOSTNAME" >> /etc/hosts
+
+            # Install latest security updates
+            yum update -y
+
+            # Miscellaneous packages
+            yum install -y mc jq
+
+            # Install docker 
+            amazon-linux-extras install docker -y
+            
+            #Start and enable docker
+            sudo systemctl enable docker
+            sudo service docker start
+            
+            #Install aws
+            yum install -y python3-setuptools
+            pip3 install awscli
+            docker run \
+            -d \
+            -p 8500:8500 \
+            -p 8600:8600/udp \
+            --name=consul \
+            consul agent -server -ui -node=server-1 -bootstrap-expect=1 -client=0.0.0.0
+
+  # ----------------------------------------------------------------------------
+  # Instance Profile and Role
+  # ----------------------------------------------------------------------------

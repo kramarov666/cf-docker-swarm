@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Swarm init
+
+# ------------------------------------------------------------------------------
+# Parameters
+# ------------------------------------------------------------------------------
+Parameters:
+
+  Env:
+  AutoScalingDesiredCapacity:
+    Type: Number
+    Default: 1
+
+  AutoScalingMaxSize:
+    Type: Number
+    Default: 1
+
+  AutoScalingMinSize:
+    Type: Number
+    Default: 1
+
+  Name:
+    Type: String
+    Description: Name of Swarm stack and deployment.
+    Default: test-summed
+  
+  AMI:
+    Type: AWS::EC2::Image::Id
+    Description: Amazon machine image to use (see https://aws.amazon.com/amazon-linux-2/release-notes/).
+    Default: ami-0b69ea66ff7391e80
+ #  amazon/amzn2-ami-hvm-2.0.20190823.1-x86_64-gp2
+  
+  EcrRole:
+    Type: String
+    Description: Role to read ECR.
+    Default: ecr-read-role-Role-KK2GTT863NVQ
+
+  SwarmBucketName:
+    Type: String
+    Description: Bucket name for Swarm, must be same for all clusters.
+    Default: swarm-bucket-summed
+
+  SecurityGroupForInternalCLB:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security groups for Internal Classic Load Balancer.
+
+  JenkinsPublicKey:
+    Type: String
+    Default: AAAAB3NzaC1yc2EAAAADAQABAAABAQC8KCE+zXpMpdJq4lCWeghYniu0bAPEqPPaqBIP2Rw5pp7WfUEtPjXN04xefwRi9zDTGQlHgLHfsL8X2F8Z3kS0gLmtd2verdf5JBeZaVqHGiRhzkBghMRf4ygIPNLqRx3/rS3wwOAT77L3gAMp34acUfnUZ7y+CrDnJR/ETM9r7AsLC7ExXPNKyGXUtWdxVzlj6nkTMZQzkEwIiashRE+5/J+0D0xRdXLDmZ+F0zmYvSkkOwlffhdFRUNkkbNRqCsuQQQ7OVJ5KXle9oAEsI/X7SiN0FaisBb+um6XVoGOG4w9zPsSiS8DWM+pKUyagI90vwdXTKD6auclBpxKMoMf
+  #Must be created in the same template
+  #TargetGroups:
+  #  Description: Target groups of external Load Balancer ARN
+  #  Type: CommaDelimitedList
+  #  Default: "dev-summed-admin,dev-summed-api,summed-fronten,dev-summed-portainer"
+  InstanceType:
+    Type: String
+    Description: Instance type.
+    AllowedValues:
+    - t2.micro
+    - t2.small
+    - t2.medium
+    - t2.large
+    - t2.xlarge
+    - t3.micro
+    - t3.small
+    - t3.medium
+    - t3.large
+    - t3.xlarge
+    - t3a.micro
+    - t3a.small
+    - t3a.medium
+    - t3a.large
+    - t3a.xlarge
+    - c3.large
+    - m3.medium
+    - m4.large
+    - m5.large
+    Default: t3a.medium
+
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID.
+#Todo only private 
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private Subnets where swarm will be deployed.
+
+  SecurityGroups:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security groups for EC2 instances.
+
+
+
+# ------------------------------------------------------------------------------
+# Resources
+# ------------------------------------------------------------------------------
+Resources:
+#  SwarmBucket:
+#    Type: AWS::S3::Bucket
+#    DeletionPolicy: Retain
+#    Properties:
+#      AccessControl: Private
+#      BucketName: !Sub ${SwarmBucketName}
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref PrivateSubnets
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 900
+      LaunchConfigurationName: !Ref LaunchConfig
+      #TargetGroupARNs:
+      #  - !Ref TargetGroups
+      DesiredCapacity: !Ref AutoScalingDesiredCapacity
+      MaxSize: !Ref AutoScalingMaxSize
+      MinSize: !Ref AutoScalingMinSize
+      Tags:
+        - { Key: Name,    Value: !Sub "${Name}", PropagateAtLaunch: true }
+        - { Key: service, Value: !Sub "${Name}", PropagateAtLaunch: true }
+        - { Key: role,    Value: !Sub "${Name}", PropagateAtLaunch: true }
+
+  LaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref AMI
+      KeyName: devops
+      IamInstanceProfile: !Ref InstanceProfile
+      AssociatePublicIpAddress: false
+      InstanceMonitoring: false
+      InstanceType: !Ref InstanceType
+      SecurityGroups: !Ref SecurityGroups
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+
+            # The bootstrap log can be found at:
+            # /var/log/cloud-init-output.log
+            # /var/log/cloud-init.log
+
+            # The following code will be placed into file on instance and executed:
+            # /var/lib/cloud/instance/scripts/part-001
+
+            set -e # Exit on error
+            set -u # Treat unset variables as error
+            set -x # Trace commands
+            set -o pipefail
+
+            # ------------------------------------------------------------------------------
+            # Common part for Amazon Linux setup on AWS EC2
+            # ------------------------------------------------------------------------------
+            # Set hostname containing instance id
+            INSTANCE_ID=$(curl -s 169.254.169.254/latest/meta-data/instance-id)
+            HOSTNAME="${Name}-${!INSTANCE_ID#i-}.localdomain"
+            INSTANCE_PRIVATE_IPV4=$(curl -s 169.254.169.254/latest/meta-data/local-ipv4)
+            CLUSTER_NOT_EXIST=false
+            hostnamectl set-hostname $HOSTNAME
+            echo "$(hostname -I) bastion $HOSTNAME" >> /etc/hosts
+
+            # Install latest security updates
+            yum update -y
+
+            # Miscellaneous packages
+            yum install -y mc jq
+
+            # Install docker 
+            amazon-linux-extras install docker -y
+            
+            #Start and enable docker
+            sudo systemctl enable docker
+            sudo service docker start
+            
+            #Install aws
+            yum install -y python3-setuptools
+            pip3 install awscli
+
+            #add user jenkins
+            JENKINS_HOME=/home/jenkins
+            useradd -m -p NeveMind -d $JENKINS_HOME -s /bin/bash jenkins
+            mkdir -p ${!JENKINS_HOME#i-}/.ssh
+            usermod -aG docker jenkins
+            echo "ssh-rsa ${JenkinsPublicKey}">${!JENKINS_HOME#i-}/.ssh/authorized_keys && chown jenkins ${!JENKINS_HOME#i-}/.ssh/authorized_keys
+            #####################################
+            #        SWARM INIT AND JOIN        #
+            aws s3api head-object --bucket ${SwarmBucketName} --key ${Name} || CLUSTER_NOT_EXIST=true
+            if [ $CLUSTER_NOT_EXIST == true ]; then
+                    echo "Cluster does not exist, so init cluster."
+                    docker swarm init --advertise-addr $INSTANCE_PRIVATE_IPV4
+                    docker swarm join-token manager | grep docker>${Name}
+                    aws s3 cp ${Name} s3://${SwarmBucketName}/${Name}
+            else
+                    echo "Cluster exists, so joining cluster"
+                    aws s3 cp s3://${SwarmBucketName}/${Name} ${Name}
+                    /bin/bash ${Name}
+            fi
+  
+
+  # ----------------------------------------------------------------------------
+  # Instance Profile and Role
+  # ----------------------------------------------------------------------------

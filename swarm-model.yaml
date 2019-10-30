@@ -5,6 +5,17 @@ Description: Swarm init
 # Parameters
 # ------------------------------------------------------------------------------
 Parameters:
+
+  Env:
+    Type: String
+    Description: Environment.
+    AllowedValues:
+    - dev
+    - qa
+    - stage
+    - prod
+    - cake
+    Default: dev
   AutoScalingDesiredCapacity:
     Type: Number
     Default: 1
@@ -21,22 +32,12 @@ Parameters:
     Type: String
     Description: Name of Swarm stack and deployment.
     Default: test-summed
-
-  ConsulAddress:
-    Type: String
-    Description: Name of Swarm stack and deployment.
-    Default: 172.31.84.218:8500
   
   AMI:
     Type: AWS::EC2::Image::Id
     Description: Amazon machine image to use (see https://aws.amazon.com/amazon-linux-2/release-notes/).
     Default: ami-0b69ea66ff7391e80
  #  amazon/amzn2-ami-hvm-2.0.20190823.1-x86_64-gp2
-  
-  EcrRole:
-    Type: String
-    Description: Role to read ECR.
-    Default: ecr-read-role-Role-KK2GTT863NVQ
 
   SwarmBucketName:
     Type: String
@@ -47,7 +48,9 @@ Parameters:
     Type: List<AWS::EC2::SecurityGroup::Id>
     Description: Security groups for Internal Classic Load Balancer.
 
-  
+  JenkinsPublicKey:
+    Type: String
+    Default: AAAAB3NzaC1yc2EAAAADAQABAAABAQC8KCE+zXpMpdJq4lCWeghYniu0bAPEqPPaqBIP2Rw5pp7WfUEtPjXN04xefwRi9zDTGQlHgLHfsL8X2F8Z3kS0gLmtd2verdf5JBeZaVqHGiRhzkBghMRf4ygIPNLqRx3/rS3wwOAT77L3gAMp34acUfnUZ7y+CrDnJR/ETM9r7AsLC7ExXPNKyGXUtWdxVzlj6nkTMZQzkEwIiashRE+5/J+0D0xRdXLDmZ+F0zmYvSkkOwlffhdFRUNkkbNRqCsuQQQ7OVJ5KXle9oAEsI/X7SiN0FaisBb+um6XVoGOG4w9zPsSiS8DWM+pKUyagI90vwdXTKD6auclBpxKMoMf
   #Must be created in the same template
   #TargetGroups:
   #  Description: Target groups of external Load Balancer ARN
@@ -76,8 +79,7 @@ Parameters:
     - m3.medium
     - m4.large
     - m5.large
-
-    Default: t2.micro
+    Default: t3a.medium
 
   VPC:
     Type: AWS::EC2::VPC::Id
@@ -104,6 +106,50 @@ Resources:
 #      AccessControl: Private
 #      BucketName: !Sub ${SwarmBucketName}
 
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-Role"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Action: ['sts:AssumeRole']
+          Principal:
+            Service: ['ec2.amazonaws.com']
+      Path: /summed/
+      Policies:
+      - PolicyName: !Sub "S3Permissions${Env}"
+        PolicyDocument:
+          Statement:
+          # Allow read actions in S3 buckets
+          - Sid: !Sub "S3ReadSwarm${Env}"
+            Effect: Allow
+            Action:
+            - s3:*
+            Resource:
+              - !Sub "arn:aws:s3:::${SwarmBucketName}"
+              - !Sub "arn:aws:s3:::${SwarmBucketName}/*"
+    
+      - PolicyName: !Sub "EcrPermissions${Env}"
+        PolicyDocument:
+          Statement:
+          # Allow pull images from ECR repositories
+          - Sid: !Sub "ECR${Env}"
+            Effect: Allow
+            Action:
+            - ecr:BatchCheckLayerAvailability
+            - ecr:BatchGetImage
+            - ecr:GetAuthorizationToken
+            - ecr:GetDownloadUrlForLayer
+            Resource: '*'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /summed/
+      Roles: 
+        - !Ref Ec2Role
+
   InternalCLB:
     Type: AWS::ElasticLoadBalancing::LoadBalancer
     Properties: 
@@ -114,9 +160,13 @@ Resources:
         IdleTimeout: 120
       CrossZone: true
       Listeners:
-        - InstancePort: 8500
+        - InstancePort: 22
           InstanceProtocol: TCP
-          LoadBalancerPort: 4500
+          LoadBalancerPort: 22
+          Protocol: TCP
+        - InstancePort: 2377
+          InstanceProtocol: TCP
+          LoadBalancerPort: 2377
           Protocol: TCP
 
       LoadBalancerName: !Sub "Internal-${Name}"
@@ -124,6 +174,10 @@ Resources:
       Scheme: Internal
       SecurityGroups: !Ref SecurityGroupForInternalCLB
       Subnets: !Ref PrivateSubnets
+      Tags: 
+        - { Key: Name,    Value: !Sub "${Name}" }
+        - { Key: service, Value: !Sub "${Name}" }
+        - { Key: role,    Value: !Sub "${Name}" }
 
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -139,12 +193,17 @@ Resources:
       DesiredCapacity: !Ref AutoScalingDesiredCapacity
       MaxSize: !Ref AutoScalingMaxSize
       MinSize: !Ref AutoScalingMinSize
+      Tags:
+        - { Key: Name,    Value: !Sub "${Name}", PropagateAtLaunch: true }
+        - { Key: service, Value: !Sub "${Name}", PropagateAtLaunch: true }
+        - { Key: role,    Value: !Sub "${Name}", PropagateAtLaunch: true }
 
   LaunchConfig:
     Type: AWS::AutoScaling::LaunchConfiguration
     Properties:
       ImageId: !Ref AMI
       KeyName: perf
+      IamInstanceProfile: !Ref InstanceProfile
       AssociatePublicIpAddress: true
       InstanceMonitoring: false
       InstanceType: !Ref InstanceType
@@ -173,6 +232,7 @@ Resources:
             INSTANCE_ID=$(curl -s 169.254.169.254/latest/meta-data/instance-id)
             HOSTNAME="${Name}-${!INSTANCE_ID#i-}.localdomain"
             INSTANCE_PRIVATE_IPV4=$(curl -s 169.254.169.254/latest/meta-data/local-ipv4)
+            CLUSTER_NOT_EXIST=false
             hostnamectl set-hostname $HOSTNAME
             echo "$(hostname -I) bastion $HOSTNAME" >> /etc/hosts
 
@@ -180,33 +240,50 @@ Resources:
             yum update -y
 
             # Miscellaneous packages
-            yum install -y mc jq git
+            yum install -y mc jq
 
             # Install docker 
             amazon-linux-extras install docker -y
+            
+            #Start and enable docker
+            sudo systemctl enable docker
+            sudo service docker start
             
             #Install aws
             yum install -y python3-setuptools
             pip3 install awscli
 
-            #curl -L https://github.com/docker/machine/releases/download/v0.16.2/docker-machine-`uname -s`-`uname -m` >/tmp/docker-machine &&
-            #chmod +x /tmp/docker-machine &&
-            #sudo cp /tmp/docker-machine /usr/local/bin/docker-machine
+            #add user jenkins
+            JENKINS_HOME=/home/jenkins
+            useradd -m -p NeveMind -d $JENKINS_HOME -s /bin/bash jenkins
+            mkdir -p ${!JENKINS_HOME#i-}/.ssh
+            usermod -aG docker jenkins
+            echo "ssh-rsa ${JenkinsPublicKey}">${!JENKINS_HOME#i-}/.ssh/authorized_keys && chown jenkins ${!JENKINS_HOME#i-}/.ssh/authorized_keys
+            #####################################
+            #        SWARM INIT AND JOIN        #
+            aws s3api head-object --bucket ${SwarmBucketName} --key ${Name} || CLUSTER_NOT_EXIST=true
+            if [ $CLUSTER_NOT_EXIST == true ]; then
+                    echo "Cluster does not exist, so init cluster."
+                    docker swarm init --advertise-addr $INSTANCE_PRIVATE_IPV4
+                    docker swarm join-token manager | grep docker>${Name}
+                    aws s3 cp ${Name} s3://${SwarmBucketName}/${Name}
+            else
+                    echo "Cluster exists, so joining cluster"
+                    aws s3 cp s3://${SwarmBucketName}/${Name} ${Name}
+                    /bin/bash ${Name}
+                    #while read swarm_managers; do
+                    #  set +e
+                    #  $swarm_managers
+                    #  if [ $? == 0 ]; then
+                    #    break;
+                    #  fi
+                    #done <${Name}
+                    #set -e
+                    #docker swarm join-token manager | grep docker>>${Name}
+                    #ws s3 cp ${Name} s3://${SwarmBucketName}/${Name}
 
-            mkdir /etc/systemd/system/docker.service.d
-            cat <<EOT >> /etc/systemd/system/docker.service.d/override.conf
-            [Service]
-            ExecStart=
-            ExecStart=/usr/bin/dockerd -H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock
-            EOT
-
-            #Start and enable docker
-            sudo systemctl daemon-reload
-            sudo systemctl enable docker
-            sudo service docker start
-
-            docker run -d -p 4000:4000 swarm manage -H :4000 --replication --advertise ${!INSTANCE_PRIVATE_IPV4#i-}:4000 consul://${ConsulAddress}
-            docker run -d swarm join --advertise=${!INSTANCE_PRIVATE_IPV4#i-}:2375 consul://${ConsulAddress}
+            fi
+  
 
   # ----------------------------------------------------------------------------
   # Instance Profile and Role

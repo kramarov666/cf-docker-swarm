@@ -71,8 +71,7 @@ Parameters:
     - m3.medium
     - m4.large
     - m5.large
-
-    Default: t3a.medium
+    Default: t2.micro
 
   VPC:
     Type: AWS::EC2::VPC::Id
@@ -140,7 +139,7 @@ Resources:
     Properties:
       ImageId: !Ref AMI
       KeyName: perf
-      AssociatePublicIpAddress: false
+      AssociatePublicIpAddress: true
       InstanceMonitoring: false
       InstanceType: !Ref InstanceType
       SecurityGroups: !Ref SecurityGroups
@@ -176,7 +175,7 @@ Resources:
             yum update -y
 
             # Miscellaneous packages
-            yum install -y mc jq
+            yum install -y mc jq git
 
             # Install docker 
             amazon-linux-extras install docker -y
